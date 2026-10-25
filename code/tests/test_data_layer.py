@@ -253,6 +253,70 @@ class TestDataLayer(unittest.TestCase):
         self.assertNotIn("support_4707", linked)
         self.assertNotIn("backup_3870", linked)
 
+    def test_search_index_nested_extraction(self):
+        """
+        Regression Test 6: Verify search index records with hits.documents or nested document
+        structures (e.g. evidence_92, evidence_02) are correctly unpacked and resolved to the right user.
+        """
+        # User 23 (thandiwe.m6866@zoho.com) -> search_898 in evidence_92
+        user_23 = self.graph.resolve_user("thandiwe.m6866@zoho.com")
+        self.assertIsNotNone(user_23)
+        items_23 = self.store.get_evidence_for_user(user_23, "2026-09-15T12:00:00Z")
+        search_898 = [it for it in items_23 if it.resource_id == "search_898"]
+        self.assertGreaterEqual(len(search_898), 1, "search_898 must be extracted and linked to user_23.")
+        self.assertEqual(search_898[0].system_id, "search_service")
+
+        # User 29 (noah.f438085@outlook.com) -> search_1993 in evidence_92
+        user_29 = self.graph.resolve_user("noah.f438085@outlook.com")
+        self.assertIsNotNone(user_29)
+        items_29 = self.store.get_evidence_for_user(user_29, "2026-09-15T12:00:00Z")
+        search_1993 = [it for it in items_29 if it.resource_id == "search_1993"]
+        self.assertGreaterEqual(len(search_1993), 1, "search_1993 must be extracted and linked to user_29.")
+
+    def test_snapshot_bundle_group_timestamp(self):
+        """
+        Regression Test 7: Verify individual snapshot group captured_at timestamps in bundle files
+        (e.g. evidence_02) are preserved so records captured before audit_at are not filtered out.
+        """
+        # User 23: audit_record_4128 was captured at 2026-09-15T12:00:00Z inside evidence_02 (manifest captured at 2026-09-17)
+        user_23 = self.graph.resolve_user("thandiwe.m6866@zoho.com")
+        items_23 = self.store.get_evidence_for_user(user_23, "2026-09-17T12:00:00Z")
+        audit_4128 = [it for it in items_23 if it.resource_id == "audit_record_4128"]
+        self.assertGreaterEqual(len(audit_4128), 1, "audit_record_4128 must be available at audit_at.")
+        self.assertEqual(audit_4128[0].captured_at, "2026-09-15T12:00:00Z")
+
+    def test_analytics_cadence_and_duplicate_prevention(self):
+        """
+        Regression Test 8 (Rank 1): Verify analytics profile correlation matches execution cadence,
+        prevents duplicate heuristic assignments, and correctly correlates batch profiles.
+        """
+        # User 32 (novak.tomasz@icloud.com): must have analytics_2034, NOT analytics_5715
+        u32 = self.graph.resolve_user("novak.tomasz@icloud.com")
+        res_32 = self.store.get_user_linked_resources(u32.user_id)
+        self.assertIn("analytics_2034", res_32)
+        self.assertNotIn("analytics_5715", res_32)
+
+        # User 29 (noah.f438085@outlook.com): must have analytics_5208, NOT analytics_6077
+        u29 = self.graph.resolve_user("noah.f438085@outlook.com")
+        res_29 = self.store.get_user_linked_resources(u29.user_id)
+        self.assertIn("analytics_5208", res_29)
+        self.assertNotIn("analytics_6077", res_29)
+
+        # User 28 (smartinez6461@gmail.com): must have analytics_6077 via cadence match
+        u28 = self.graph.resolve_user("smartinez6461@gmail.com")
+        res_28 = self.store.get_user_linked_resources(u28.user_id)
+        self.assertIn("analytics_6077", res_28)
+
+        # User 26 (almeida.mariana@gmail.com): must have analytics_4566
+        u26 = self.graph.resolve_user("almeida.mariana@gmail.com")
+        res_26 = self.store.get_user_linked_resources(u26.user_id)
+        self.assertIn("analytics_4566", res_26)
+
+        # User 25 (s.yoon04@gmail.com): must have analytics_1895 via batch FIFO
+        u25 = self.graph.resolve_user("s.yoon04@gmail.com")
+        res_25 = self.store.get_user_linked_resources(u25.user_id)
+        self.assertIn("analytics_1895", res_25)
+
 
 if __name__ == "__main__":
     unittest.main()

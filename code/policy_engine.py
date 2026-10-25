@@ -132,13 +132,12 @@ class PolicyEngine:
         ev_items = self.store.get_evidence_for_user(user, audit_at)
 
         # 4. Determine primary account ID
-        acct_id = None
-        for it in ev_items:
-            if it.system_id == "account_service" and it.resource_id.startswith("account_"):
-                acct_id = it.resource_id
-                break
+        acct_id = self.store.get_or_recover_account_id(user, request_info=req_row)
         if not acct_id:
-            acct_id = self.store.get_or_recover_account_id(user, request_info=req_row)
+            for it in ev_items:
+                if it.system_id == "account_service" and it.resource_id.startswith("account_"):
+                    acct_id = it.resource_id
+                    break
         if not acct_id:
             for rid in self.store.get_user_linked_resources(user.user_id):
                 if rid.startswith("account_"):
@@ -149,59 +148,98 @@ class PolicyEngine:
             if digits:
                 acct_id = f"account_{int(digits):03d}"
 
-        # 5. Group empirical evidence by (system_id, resource_id)
+        # 5. Group empirical evidence by (system_id, resource_id) in chronological order
+        ev_items.sort(key=lambda it: it.captured_at)
         res_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for it in ev_items:
             key = (it.system_id, it.resource_id)
             has_direct = bool(it.email or it.phone or it.name or it.user_id or it.email_hash)
+            file_cap = self.store.manifest.get(it.evidence_id, {}).get("captured_at", it.captured_at)
+            can_cite = bool(file_cap <= audit_at)
+
             if key not in res_map:
                 res_map[key] = {
                     "system_id": it.system_id,
                     "resource_id": it.resource_id,
                     "record_type": it.record_type,
                     "state": it.status_indicator,
-                    "evidence_id": it.evidence_id,
+                    "evidence_id": it.evidence_id if can_cite else "",
                     "captured_at": it.captured_at,
                     "has_pii": bool(it.email or it.phone or it.name),
                     "has_direct": has_direct,
+                    "can_cite": can_cite,
                     "items": [it],
                 }
             else:
                 entry = res_map[key]
                 entry["items"].append(it)
-                # Active/Present violation precedence over compliant states
-                if it.status_indicator in ("PRESENT", "ACTIVE") and entry["state"] not in ("PRESENT", "ACTIVE"):
-                    entry["state"] = it.status_indicator
-                    entry["evidence_id"] = it.evidence_id
-                    entry["captured_at"] = it.captured_at
-                    entry["has_direct"] = has_direct
-                elif entry["state"] in ("PRESENT", "ACTIVE") and it.status_indicator in ("PRESENT", "ACTIVE"):
-                    # If both are violation states, prefer direct identity match over indirect/untraced logs
-                    if has_direct and not entry.get("has_direct", False):
-                        entry["evidence_id"] = it.evidence_id
-                        entry["captured_at"] = it.captured_at
-                        entry["has_direct"] = True
-                    elif it.captured_at > entry["captured_at"] and (has_direct or not entry.get("has_direct", False)):
-                        entry["evidence_id"] = it.evidence_id
-                        entry["captured_at"] = it.captured_at
-                elif it.captured_at > entry["captured_at"]:
-                    if entry["state"] not in ("PRESENT", "ACTIVE") or it.status_indicator in ("PRESENT", "ACTIVE"):
-                        entry["state"] = it.status_indicator
-                        entry["evidence_id"] = it.evidence_id
-                        entry["captured_at"] = it.captured_at
                 if it.email or it.phone or it.name:
                     entry["has_pii"] = True
+
+                # Chronological progression:
+                # 1. If newer observation (it.captured_at > entry["captured_at"]): updates state
+                # 2. If same time (it.captured_at == entry["captured_at"]): violation (PRESENT/ACTIVE) takes precedence
+                if it.captured_at > entry["captured_at"]:
+                    entry["state"] = it.status_indicator
+                    if can_cite:
+                        entry["evidence_id"] = it.evidence_id
+                        entry["can_cite"] = True
+                    entry["captured_at"] = it.captured_at
+                    entry["has_direct"] = has_direct
+                elif it.captured_at == entry["captured_at"]:
+                    if it.status_indicator in ("PRESENT", "ACTIVE") and entry["state"] not in ("PRESENT", "ACTIVE"):
+                        entry["state"] = it.status_indicator
+                        if can_cite:
+                            entry["evidence_id"] = it.evidence_id
+                            entry["can_cite"] = True
+                        entry["has_direct"] = has_direct
+                    elif can_cite and not entry.get("can_cite"):
+                        entry["evidence_id"] = it.evidence_id
+                        entry["can_cite"] = True
+
+        # Prune obsolete account_service resources and lifecycles
+        if acct_id:
+            obsolete_acc_keys = [
+                k for k in res_map.keys()
+                if k[0] == "account_service" and k[1] != acct_id
+            ]
+            for k in obsolete_acc_keys:
+                del res_map[k]
+
+        # For ACCOUNT_TOMBSTONE: if a tombstone was created before requested_at,
+        # it belongs to an earlier lifecycle and is not part of this deletion request.
+        req_at = req_row.get("requested_at", "")
+        if req_at:
+            tombstone_keys_to_remove = [
+                k for k, v in res_map.items()
+                if v.get("record_type") == "ACCOUNT_TOMBSTONE" and v.get("captured_at", "") < req_at
+            ]
+            for k in tombstone_keys_to_remove:
+                del res_map[k]
 
         # Ensure account presence is accounted for
         if acct_id and ("account_service", acct_id) not in res_map:
             # Determine appropriate evidence proving absence before audit_at
-            default_ev = "evidence_54"
-            default_cap = "2026-09-02T23:00:00Z"
+            default_ev = ""
+            default_cap = ""
             for it in ev_items:
-                if it.evidence_id in ("evidence_51", "evidence_92", "evidence_94") and it.captured_at <= audit_at:
+                f_meta = self.store.manifest.get(it.evidence_id, {})
+                f_cap = f_meta.get("captured_at", it.captured_at)
+                if f_cap <= audit_at and it.captured_at <= audit_at and it.system_id == "account_service":
                     default_ev = it.evidence_id
                     default_cap = it.captured_at
                     break
+
+            # If not in user's direct items, find the most recent relevant evidence file for account_service available at or before audit_at
+            if not default_ev:
+                for fid, fmeta in sorted(self.store.manifest.items(), key=lambda kv: kv[1]["captured_at"], reverse=True):
+                    if fmeta["captured_at"] <= audit_at:
+                        src = fmeta.get("source_origin", "")
+                        fpath = fmeta.get("file_path", "")
+                        if src == "account_service" or "customer_accounts" in fpath or "account" in fpath:
+                            default_ev = fid
+                            default_cap = fmeta["captured_at"]
+                            break
 
             res_map[("account_service", acct_id)] = {
                 "system_id": "account_service",
@@ -209,8 +247,9 @@ class PolicyEngine:
                 "record_type": "USER_PROFILE",
                 "state": "ABSENT",
                 "evidence_id": default_ev,
-                "captured_at": default_cap,
+                "captured_at": default_cap or audit_at,
                 "has_pii": False,
+                "can_cite": bool(default_ev),
                 "items": [],
             }
 
@@ -222,7 +261,7 @@ class PolicyEngine:
         for (sys_id, res_id), rinfo in res_map.items():
             cat = rinfo["record_type"]
             state = rinfo["state"]
-            ev_id = rinfo["evidence_id"]
+            ev_id = rinfo["evidence_id"] if rinfo.get("can_cite") else ""
             has_pii = rinfo["has_pii"]
 
             # Required action from deletion rules
@@ -428,7 +467,11 @@ class PolicyEngine:
                 })
 
         # 7. Decide overall status and sort steps
-        is_complete = len(findings) == 0
+        has_evidence_for_all = all(bool(v.get("evidence_id")) for v in verifications) if verifications else False
+        is_complete = (len(findings) == 0) and has_evidence_for_all
+
+        # Ensure all findings cite visible evidence per contract (AGENTS.md §6.3, §6.6)
+        findings = [f for f in findings if f.get("evidence_id")]
 
         # Sort findings: (operation priority, system_id, resource_id)
         findings.sort(

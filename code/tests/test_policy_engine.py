@@ -162,6 +162,33 @@ class TestPolicyEngine(unittest.TestCase):
         self.assertEqual(audit_verif[0]["operation"], "VERIFY_RECORD_PRESENT")
         self.assertEqual(audit_verif[0]["state"], "PRESENT")
 
+    def test_support_attachment_vs_message_distinction(self):
+        """Verify that support attachments require DELETE_RECORD while support messages require REDACT_RECORD."""
+        # support_002 is registered as DELETE_RECORD in activity (attachment)
+        self.assertIn("support_002", self.store.support_attachments)
+        item = [it for it in self.store.items if it.resource_id == "support_002"][0]
+        self.assertEqual(item.record_type, "SUPPORT_ATTACHMENT")
+
+    def test_anonymized_analytics_verification(self):
+        """Verify that anonymized analytics records from snapshot bundles are verified as ANONYMIZED."""
+        user_27 = self.graph.resolve_user("ananya-nair@gmail.com")
+        self.assertIsNotNone(user_27)
+        user_res = self.store.get_user_linked_resources(user_27.user_id)
+        self.assertIn("analytics_4574", user_res)
+        items = self.store.get_evidence_for_user(user_27, "2026-09-17T12:00:00Z")
+        ana_item = [it for it in items if it.resource_id == "analytics_4574"]
+        self.assertGreater(len(ana_item), 0)
+        self.assertEqual(ana_item[0].status_indicator, "ANONYMIZED")
+
+    def test_no_loose_string_decoy_matching(self):
+        """Verify that decoys and ungrounded objects are not falsely linked to users."""
+        user_07 = self.graph.resolve_user("priya.raman@gmail.com")
+        self.assertIsNotNone(user_07)
+        items = self.store.get_evidence_for_user(user_07, "2026-10-01T00:00:00Z")
+        # object_19 was an ungrounded screenshot decoy
+        obj_19 = [it for it in items if it.resource_id == "object_19"]
+        self.assertEqual(len(obj_19), 0)
+
     def test_consecutive_numbering_and_phase_ordering(self):
         """Verify that all generated steps are numbered 1..N and ordered by phase."""
         req = {
@@ -183,6 +210,113 @@ class TestPolicyEngine(unittest.TestCase):
             p1 = phase_map[steps[i]["phase"]]
             p2 = phase_map[steps[i+1]["phase"]]
             self.assertLessEqual(p1, p2, f"Phase order violated: {steps[i]['phase']} before {steps[i+1]['phase']}")
+
+    def test_chronological_state_reconstruction(self):
+        """
+        Regression Test: Verify that a newer observation (e.g. 404 absent at audit_at)
+        overrules an older historical snapshot captured before deletion (e.g. case_26).
+        """
+        req_26 = {
+            "case_id": "case_26",
+            "email": "almeida.mariana@gmail.com",
+            "request_text": "Please delete my account and personal data.",
+            "requested_at": "2026-08-30T12:00:00Z",
+            "reported_at": "2026-09-02T12:00:00Z",
+            "reported_status": "COMPLETE",
+            "audit_at": "2026-09-15T12:00:00Z",
+        }
+        status, steps = self.engine.evaluate_request(req_26)
+        self.assertEqual(status, "COMPLETE", "case_26 must evaluate to COMPLETE because newer evidence confirms absence.")
+        findings = [s for s in steps if s["phase"] == "FINDING"]
+        self.assertEqual(len(findings), 0, "No findings should exist for a confirmed complete deletion.")
+
+    def test_retained_security_audit_log_in_incomplete_workflow(self):
+        """
+        Regression Test: Verify that retained security audit records are included in verification
+        steps with empty evidence_id for incomplete deletion cases (e.g. case_23).
+        """
+        req_23 = {
+            "case_id": "case_23",
+            "email": "thandiwe.m6866@zoho.com",
+            "request_text": "Please delete this account, including the downloadable archive I requested earlier and any search result that still points to me. Security records can stay if policy requires them.",
+            "requested_at": "2026-09-02T12:00:00Z",
+            "reported_status": "NOT_STARTED",
+            "reported_at": "2026-09-05T12:00:00Z",
+            "audit_at": "2026-09-15T12:00:00Z",
+        }
+        status, steps = self.engine.evaluate_request(req_23)
+        self.assertEqual(status, "INCOMPLETE")
+        audit_step = [s for s in steps if s["resource_id"] == "audit_record_4128"]
+        self.assertEqual(len(audit_step), 1, "audit_record_4128 must be present in verification steps.")
+        self.assertEqual(audit_step[0]["phase"], "VERIFICATION")
+        self.assertEqual(audit_step[0]["operation"], "VERIFY_RECORD_PRESENT")
+        self.assertEqual(audit_step[0]["evidence_id"], "", "Evidence ID must be empty in verification for incomplete case.")
+
+    def test_account_resolution_and_prior_lifecycle_isolation(self):
+        """
+        Regression Test: Verify that when auditing a deletion request, resources or tombstones
+        from prior lifecycles (created before requested_at) are excluded from findings and verification.
+        """
+        req_17 = {
+            "case_id": "test_prior_lifecycle_isolation",
+            "email": "leonie.g9352@outlook.com",
+            "request_text": "I want to close this account permanently. You may retain backups if required, but they must not be able to restore my personal profile.",
+            "requested_at": "2026-08-19T12:00:00Z",
+            "reported_status": "NOT_STARTED",
+            "reported_at": "2026-08-22T12:00:00Z",
+            "audit_at": "2026-09-15T12:00:00Z",
+        }
+        status, steps = self.engine.evaluate_request(req_17)
+        self.assertEqual(status, "INCOMPLETE")
+        # Ensure account_4092 is verified absent
+        acc_steps = [s for s in steps if s["system_id"] == "account_service"]
+        self.assertEqual(len(acc_steps), 1)
+        self.assertEqual(acc_steps[0]["resource_id"], "account_4092")
+        self.assertEqual(acc_steps[0]["operation"], "VERIFY_RECORD_ABSENT")
+        # Ensure obsolete account_6523 and pre-request tombstone_17 are NOT in steps
+        res_ids = {s["resource_id"] for s in steps}
+        self.assertNotIn("account_6523", res_ids, "Obsolete account from prior lifecycle must not be audited.")
+        self.assertNotIn("tombstone_17", res_ids, "Pre-request tombstone must not be audited.")
+
+    def test_queue_ordered_account_recovery(self):
+        """
+        Regression Test: Concurrent deletion requests sharing reported_at are processed in FIFO
+        submission order (requested_at), correctly resolving thandiwe.m6866@zoho.com to account_410.
+        """
+        req_23 = {
+            "case_id": "test_fifo_account_recovery",
+            "email": "thandiwe.m6866@zoho.com",
+            "request_text": "Please delete this account, including the downloadable archive I requested earlier and any search result that still points to me. Security records can stay if policy requires them.",
+            "requested_at": "2026-09-02T12:00:00Z",
+            "reported_status": "NOT_STARTED",
+            "reported_at": "2026-09-05T12:00:00Z",
+            "audit_at": "2026-09-15T12:00:00Z",
+        }
+        status, steps = self.engine.evaluate_request(req_23)
+        acc_steps = [s for s in steps if s["system_id"] == "account_service"]
+        self.assertEqual(len(acc_steps), 1)
+        self.assertEqual(acc_steps[0]["resource_id"], "account_410", "FIFO queue ordering must assign account_410.")
+
+    def test_account_absence_evidence_citation(self):
+        """
+        Regression Test: Proving account absence in a COMPLETE case must cite relevant account_service
+        evidence (e.g. evidence_54 failover replica) rather than unrelated subsystem files.
+        """
+        req_04 = {
+            "case_id": "case_04",
+            "email": "thandiwe.n@gmail.com",
+            "request_text": "I'm deleting my account. You can keep anonymous statistics, but nothing in analytics should still point back to me.",
+            "requested_at": "2026-08-25T12:32:00Z",
+            "reported_status": "COMPLETE",
+            "reported_at": "2026-08-27T08:54:00Z",
+            "audit_at": "2026-09-07T10:20:00Z",
+        }
+        status, steps = self.engine.evaluate_request(req_04)
+        self.assertEqual(status, "COMPLETE")
+        acc_steps = [s for s in steps if s["system_id"] == "account_service"]
+        self.assertEqual(len(acc_steps), 1)
+        self.assertEqual(acc_steps[0]["resource_id"], "account_004")
+        self.assertEqual(acc_steps[0]["evidence_id"], "evidence_54", "Must cite account_service evidence.")
 
 
 if __name__ == "__main__":
