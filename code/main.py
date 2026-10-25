@@ -47,6 +47,7 @@ def run_pipeline(
     print("\n[3/4] Initializing Policy Engine...")
     rules_csv = os.path.join(dataset_dir, "deletion_rules.csv")
     policy_engine = PolicyEngine(rules_csv, id_graph, evidence_store)
+    print(f"      Loaded {len(policy_engine.rules)} deletion rules from {policy_engine.rules_csv}.")
 
     # 4. Process deletion requests
     print("\n[4/4] Evaluating deletion requests...")

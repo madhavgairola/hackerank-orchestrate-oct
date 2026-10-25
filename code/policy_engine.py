@@ -28,16 +28,21 @@ class PolicyEngine:
 
     def __init__(
         self,
-        dataset_dir: str,
+        dataset_dir_or_rules_path: str,
         identity_graph: IdentityGraph,
         evidence_store: EvidenceStore,
     ) -> None:
-        self.dataset_dir = dataset_dir
+        if os.path.isfile(dataset_dir_or_rules_path):
+            self.rules_csv = dataset_dir_or_rules_path
+            self.dataset_dir = os.path.dirname(dataset_dir_or_rules_path) or "dataset"
+        else:
+            self.dataset_dir = dataset_dir_or_rules_path
+            self.rules_csv = os.path.join(dataset_dir_or_rules_path, "deletion_rules.csv")
+
         self.graph = identity_graph
         self.store = evidence_store
 
         # Rules manifest from deletion_rules.csv
-        self.rules_csv = os.path.join(dataset_dir, "deletion_rules.csv")
         self.rules: Dict[str, str] = self._load_rules()
 
         # Multilingual & non-deletion intent patterns
@@ -61,6 +66,19 @@ class PolicyEngine:
             r"surname is misspelled",
             r"mobile number on my profile is out of date",
             r"download my account information",
+            r"mantendo a conta ativa",
+            r"mantendo.*ativa",
+            r"não apag",
+            r"nao apag",
+            r"manteniendo.*activa",
+            r"no eliminar",
+            r"no borre",
+            r"laisser le compte actif",
+            r"ne pas supprimer",
+            r"アカウントを維持",
+            r"削除しないで",
+            r"계정을 유지",
+            r"삭제하지 마",
         ]
 
         # Operation priority contracts from problem statement §6.4
@@ -99,8 +117,8 @@ class PolicyEngine:
 
     def is_deletion_request(self, text: str) -> bool:
         """Determines if the request text authorizes deletion rather than access/correction/export."""
-        if not text:
-            return True
+        if not text or not str(text).strip():
+            return False
         t = str(text).lower()
         for p in self.non_deletion_patterns:
             if re.search(p, t):
@@ -222,6 +240,7 @@ class PolicyEngine:
             # Determine appropriate evidence proving absence before audit_at
             default_ev = ""
             default_cap = ""
+            # 1. Direct account_service evidence in user's bundle
             for it in ev_items:
                 f_meta = self.store.manifest.get(it.evidence_id, {})
                 f_cap = f_meta.get("captured_at", it.captured_at)
@@ -230,7 +249,20 @@ class PolicyEngine:
                     default_cap = it.captured_at
                     break
 
-            # If not in user's direct items, find the most recent relevant evidence file for account_service available at or before audit_at
+            # 2. Comprehensive customer assurance snapshot bundle in user's evidence
+            if not default_ev:
+                for it in ev_items:
+                    f_meta = self.store.manifest.get(it.evidence_id, {})
+                    f_cap = f_meta.get("captured_at", it.captured_at)
+                    f_path = f_meta.get("file_path", "")
+                    f_orig = f_meta.get("source_origin", "")
+                    if f_cap <= audit_at and it.captured_at <= audit_at:
+                        if "bundle" in f_path or "assurance" in f_orig:
+                            default_ev = it.evidence_id
+                            default_cap = f_cap
+                            break
+
+            # 3. Fall back to most recent relevant account_service snapshot
             if not default_ev:
                 for fid, fmeta in sorted(self.store.manifest.items(), key=lambda kv: kv[1]["captured_at"], reverse=True):
                     if fmeta["captured_at"] <= audit_at:

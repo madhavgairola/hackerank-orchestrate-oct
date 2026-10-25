@@ -25,6 +25,50 @@ Start your AI coding tool from the **repository root** so it automatically reads
 
 Build your solution in `code/main.py`, or use another language and document its setup and run command clearly in your README.
 
+### Environment Setup
+
+Install required Python dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+### Running the Deletion-Audit Pipeline
+
+Run the end-to-end audit agent on the complete 518-case dataset:
+
+```bash
+python3 code/main.py --dataset dataset --requests dataset/deletion_requests.csv --output output.csv
+```
+
+Optional CLI flags:
+- `--dataset`: Directory path containing the dataset files (default: `dataset`).
+- `--requests`: Path to the requests CSV to audit (default: `dataset/deletion_requests.csv`).
+- `--output`: Path to write the output CSV (default: `output.csv`).
+
+To run on the 32 sample requests:
+
+```bash
+python3 code/main.py --dataset dataset --requests dataset/sample_deletion_requests.csv --output sample_pred.csv
+```
+
+### Running Unit & Invariant Tests
+
+Run the full automated test suites:
+
+```bash
+python3 code/tests/test_data_layer.py
+python3 code/tests/test_policy_engine.py
+```
+
+### Running the Benchmark Evaluator
+
+Compare predictions against ground truth:
+
+```bash
+python3 code/evaluation/main.py --pred sample_pred.csv --truth dataset/sample_output.csv
+```
+
 Your solution must:
 
 - Read the input files from `dataset/`

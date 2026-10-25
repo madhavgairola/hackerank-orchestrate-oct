@@ -19,7 +19,7 @@ The pipeline was benchmarked against the 32 ground-truth cases in `dataset/sampl
 |---|---|---|---|
 | **Case-Level Status Accuracy** | **100.00% (32 / 32)** | 100% | **PASS** |
 | **Step-Count Accuracy** | **87.50% (28 / 32)** | > 70% | **PASS** |
-| **Full Sequence Accuracy** | **78.12% (25 / 32)** | > 60% | **PASS** |
+| **Full Sequence Accuracy** | **84.38% (27 / 32)** | > 60% | **PASS** |
 
 ### Status Category Breakdown
 | Deletion Status | Ground Truth Cases | Predicted Cases | Correct Predictions | Accuracy |
@@ -32,19 +32,19 @@ The pipeline was benchmarked against the 32 ground-truth cases in `dataset/sampl
 Evaluating exact match across all step tuples `(phase, system_id, resource_id, operation, state, evidence_id)`:
 - **Total Predicted Steps**: 189
 - **Total Ground Truth Steps**: 193
-- **Step Precision**: **96.30%**
-- **Step Recall**: **94.30%**
-- **Step F1 Score**: **95.29%**
+- **Step Precision**: **97.35%**
+- **Step Recall**: **95.34%**
+- **Step F1 Score**: **96.34%**
 
 ### Field-Level Accuracies (Aligned Positions)
 | Step Attribute | Accuracy | Matching Fields / Total Aligned |
 |---|---|---|
 | `phase` | **100.00%** | 189 / 189 |
 | `system_id` | **97.88%** | 185 / 189 |
-| `resource_id` | **96.83%** | 183 / 189 |
+| `resource_id` | **97.35%** | 184 / 189 |
 | `operation` | **97.88%** | 185 / 189 |
 | `state` | **97.88%** | 185 / 189 |
-| `evidence_id` | **98.94%** | 187 / 189 |
+| `evidence_id` | **100.00%** | 189 / 189 |
 
 ---
 
@@ -53,10 +53,10 @@ Evaluating exact match across all step tuples `(phase, system_id, resource_id, o
 The agent was evaluated end-to-end on all 518 evaluation requests in `dataset/deletion_requests.csv`, generating the final `output.csv`.
 
 - **Total Cases Processed**: 518 / 518 (100.0%)
-- **Total Execution Time**: 11.83 seconds (~22.8 ms / case)
+- **Total Execution Time**: 15.32 seconds (~29.6 ms / case)
 - **Status Breakdown**:
-  - `COMPLETE`: 149 cases (28.8%)
-  - `INCOMPLETE`: 359 cases (69.3%)
+  - `COMPLETE`: 151 cases (29.2%)
+  - `INCOMPLETE`: 357 cases (68.9%)
   - `NOT_APPLICABLE`: 10 cases (1.9%)
 - **Contract & Validation Checks**:
   - Header & Column Ordering (`case_id,deletion_status,steps_json`): **PASS** (0 errors)

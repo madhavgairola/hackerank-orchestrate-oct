@@ -484,18 +484,16 @@ class EvidenceStore:
                 if owner is None or owner == user.user_id:
                     unbound_cands.append(c_id)
 
+            rec_acc = None
             if len(unbound_cands) == 1:
                 rec_acc = unbound_cands[0]
-                self.user_to_resources.setdefault(user.user_id, set()).add(rec_acc)
-                self.resource_to_user[rec_acc] = user.user_id
-                return rec_acc
             elif len(unbound_cands) > 1:
                 # Match by queue ordering with other requests sharing the same reported_at
                 all_reqs = self._get_all_requests_cache()
                 same_rep_reqs = all_reqs[
                     (all_reqs["reported_at"] == rep_at)
                     & (all_reqs["reported_status"] == rep_stat)
-                ].sort_values(["requested_at", "email"])
+                ].sort_values("case_id")
 
                 sorted_matching = matching[matching["resource_id"].isin(unbound_cands)].sort_values("dt")
                 req_emails = list(same_rep_reqs["email"].str.lower())
@@ -508,17 +506,22 @@ class EvidenceStore:
 
                 if matching_idx is not None and matching_idx < len(sorted_matching):
                     rec_acc = str(sorted_matching.iloc[matching_idx]["resource_id"]).strip()
-                    self.user_to_resources.setdefault(user.user_id, set()).add(rec_acc)
-                    self.resource_to_user[rec_acc] = user.user_id
-                    return rec_acc
                 else:
                     # Pick closest in time to reported_at
                     matching_unbound = matching[matching["resource_id"].isin(unbound_cands)].copy()
                     matching_unbound["time_diff"] = (matching_unbound["dt"] - rep_dt).abs()
                     rec_acc = str(matching_unbound.sort_values("time_diff").iloc[0]["resource_id"]).strip()
-                    self.user_to_resources.setdefault(user.user_id, set()).add(rec_acc)
-                    self.resource_to_user[rec_acc] = user.user_id
-                    return rec_acc
+
+            if rec_acc:
+                # Disassociate any obsolete prior accounts from earlier lifecycles
+                for old_acc in list(self.user_to_resources.get(user.user_id, set())):
+                    if old_acc.startswith("account_") and old_acc != rec_acc:
+                        self.user_to_resources[user.user_id].remove(old_acc)
+                        if self.resource_to_user.get(old_acc) == user.user_id:
+                            del self.resource_to_user[old_acc]
+                self.user_to_resources.setdefault(user.user_id, set()).add(rec_acc)
+                self.resource_to_user[rec_acc] = user.user_id
+                return rec_acc
         except Exception:
             pass
 
