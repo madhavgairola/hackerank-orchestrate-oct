@@ -191,8 +191,3 @@ python3 scratch/validate_output.py
     └── usage_report.md                 # Root copy of token usage & compute report
 ```
 
----
-
-## 8. Official Submission Link
-Submissions are evaluated on HackerRank Orchestrate at:  
-**https://www.hackerrank.com/contests/hackerrank-orchestrate-october26/challenges/ghost-data-still-exists**
