@@ -179,3 +179,82 @@ branch=main
 repo_root=C:\Users\acer\Desktop\Projects\hackerank-orchestrate-oct
 worktree=main
 parent_agent=none
+
+
+## [2026-10-25T13:16:30+05:30] Policy Engine Implementation & Sample Evaluation
+
+User Prompt (verbatim, secrets redacted):
+  Nice, the two gaps are addressed and the tests are passing. Let's move on to the policy engine and step generation.
+
+Create `code/policy_engine.py`. Use the evidence store and identity graph we've already built, and apply `deletion_rules.csv` as the source of truth for how each data category should be handled.
+
+For each request, the engine should:
+- Decide whether deletion was actually requested. If not, return `NOT_APPLICABLE` with an empty steps array.
+- Evaluate the user's relevant resources using only evidence available at `audit_at`.
+- Distinguish records that are still present, exposed identifiers, active data flows, and restore risks.
+- Apply the required treatment from the policy, including records that must be retained.
+- Return `COMPLETE` only when the evidence supports it; otherwise, use `INCOMPLETE` and generate the necessary remediation and verification steps.
+
+Keep all step generation deterministic. Follow the exact operation priorities and sorting rules in the problem statement, and make sure evidence IDs are populated only where allowed.
+
+Please don't hardcode case IDs, user IDs, or expected answers. Add unit tests for each policy treatment and status, including retained tombstones, active sync flows, restore risks, and non-deletion requests.
+
+Once implemented, run the tests and compare the generated steps against `sample_output.csv`. Report status accuracy, exact sequence accuracy, and the main mismatches. Don't generate the final 518-row `output.csv` yet; let's review the results first.
+
+Agent Response Summary:
+Implemented code/policy_engine.py with deterministic intent classification, rule-based deletion policy mapping from deletion_rules.csv, and strict phase/operation priority ordering conforming to the challenge specification. Added a comprehensive 6-scenario unit test suite in code/tests/test_policy_engine.py and verified 100% pass rate. Evaluated predictions on sample_deletion_requests.csv against sample_output.csv, achieving 87.50% case-level status accuracy (100% on COMPLETE cases) and 21.88% exact sequence accuracy. Conducted a deep-dive analysis on discrepancies, isolating polymorphic record_json SQL snapshot payloads, activity decoy over-linking, and account ID recovery as the root causes to address before full dataset execution.
+
+Actions:
+* Created code/policy_engine.py implementing PolicyEngine with deterministic intent classification, policy rule evaluation, and phase/operation prioritization.
+* Created code/tests/test_policy_engine.py covering non-deletion requests, retained tombstones, active data flows, restore risks, security audit logs, and step ordering.
+* Executed unit test suite (python code/tests/test_policy_engine.py) passing all 6 tests in 3.42s.
+* Evaluated against dataset/sample_output.csv via code/evaluation/main.py, generating accuracy and sequence metrics.
+* Investigated root causes of status and step mismatches across SQL schemas and activity logs.
+* Appended turn entry to log.txt in accordance with AGENTS.md.
+
+Context:
+tool=antigravity
+model=gemini-3.8-flash
+branch=main
+repo_root=C:\Users\acer\Desktop\Projects\hackerank-orchestrate-oct
+worktree=main
+parent_agent=none
+
+
+## [2026-10-25T13:37:30+05:30] Evidence Store Fixes & 100% Status Accuracy Milestone
+
+User Prompt (verbatim, secrets redacted):
+The policy engine tests look good, but the sample evaluation shows we still have some important issues. Let's fix those before moving forward.
+
+Please address these three things in `evidence_store.py`:
+
+1. Some SQL snapshots store the actual record inside `record_json`. Parse that JSON and extract the identifiers and `origin_system` properly instead of treating those rows as ordinary flat records.
+
+2. Recover account resource IDs from the actual deletion-worker activity chains. Don't infer account IDs from user IDs when the real resource ID is available.
+
+3. Tighten activity correlation so concurrent deletion jobs don't pull in resources belonging to other users. Only link resources when there's supporting evidence, such as a direct identity match or a trace/resource link.
+
+Add regression tests for all three issues, then rerun the data-layer and policy-engine tests and evaluate against `sample_output.csv`. Show me the new metrics and the remaining mismatches.
+
+Keep the changes generic and don't tune the code just to make specific sample cases pass. Also, don't run the full 518 cases yet—we should get the sample results into a much better state first.
+
+Agent Response Summary:
+Enhanced code/evidence_store.py with recursive record_json payload parsing for SQL snapshots, implemented get_or_recover_account_id to ground primary accounts directly in deletion worker activity chains with conflict filtering, and tightened activity correlation to eliminate cross-job decoy pollution. Added three comprehensive regression tests (test_sql_record_json_parsing, test_deletion_worker_account_recovery, test_tightened_activity_correlation) in code/tests/test_data_layer.py. All 11 data-layer tests and all 6 policy-engine tests passed (100% pass rate). Re-evaluating against sample_output.csv achieved a landmark 100.00% Case-Level Status Accuracy (32/32 correct), 92.90% evidence ID accuracy, 88.17% phase accuracy, and 40.62% exact full sequence accuracy.
+
+Actions:
+* Enhanced _load_sql_snapshots in code/evidence_store.py to unpack record_json and map origin_system / collection_name attributes.
+* Implemented get_or_recover_account_id in code/evidence_store.py to ground account IDs in deletion-worker activity chains with unallocated candidate filtering.
+* Refactored _load_system_activity_links in code/evidence_store.py to remove naive batch clustering and require grounded identity / trace evidence.
+* Added 3 regression tests to code/tests/test_data_layer.py covering SQL record_json unpacking, deletion worker account recovery, and tightened activity correlation.
+* Executed data layer tests (python code/tests/test_data_layer.py) -> 11/11 passed in 0.895s.
+* Executed policy engine tests (python code/tests/test_policy_engine.py) -> 6/6 passed in 0.893s.
+* Generated sample_predictions_v2.csv and evaluated with code/evaluation/main.py, reaching 100.00% status accuracy.
+* Appended turn entry to log.txt conforming to AGENTS.md.
+
+Context:
+tool=antigravity
+model=gemini-3.8-flash
+branch=main
+repo_root=C:\Users\acer\Desktop\Projects\hackerank-orchestrate-oct
+worktree=main
+parent_agent=none

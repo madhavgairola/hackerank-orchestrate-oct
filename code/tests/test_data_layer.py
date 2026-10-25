@@ -184,11 +184,74 @@ class TestDataLayer(unittest.TestCase):
         exposed_items = [it for it in analytics_29 if it.status_indicator == "PRESENT" and it.email is not None]
         self.assertGreater(len(exposed_items), 0, "analytics_5208 should be proven PRESENT with exposed email in snapshot.")
 
-        # User 04 (thandiwe.n@gmail.com): analytics_901 is associated through deletion workflow session
-        linked_04 = self.store.get_user_linked_resources(user_04.user_id) if hasattr(self, 'user_04') else set()
+        # User 04 (thandiwe.n@gmail.com): analytics_901 is associated through trace/evidence
         user_04 = self.graph.resolve_user("thandiwe.n@gmail.com")
         linked_04 = self.store.get_user_linked_resources(user_04.user_id)
-        self.assertIn("analytics_901", linked_04, "analytics_901 should be associated with user_04 via deletion worker session.")
+        self.assertIn("analytics_901", linked_04, "analytics_901 should be associated with user_04.")
+
+    def test_sql_record_json_parsing(self):
+        """
+        Regression Test 3 (Issue 1): Verify SQL snapshots with record_json (e.g. evidence_05)
+        parse payloads, extract origin_system, and link identifiers properly.
+        """
+        user_53 = self.graph.resolve_user("diya.k4436@outlook.com")
+        self.assertIsNotNone(user_53)
+        items = self.store.get_evidence_for_user(user_53, "2026-09-21T10:00:00Z")
+        ev05_items = [it for it in items if it.evidence_id == "evidence_05"]
+        self.assertGreater(len(ev05_items), 0, "evidence_05 records inside record_json must be unpacked.")
+
+        # Check account_994 is mapped to account_service and marked PRESENT
+        acc_994 = [it for it in ev05_items if it.resource_id == "account_994"]
+        self.assertEqual(len(acc_994), 1)
+        self.assertEqual(acc_994[0].system_id, "account_service")
+        self.assertEqual(acc_994[0].status_indicator, "PRESENT")
+
+        # Check search_1007 is mapped to search_service
+        search_1007 = [it for it in ev05_items if it.resource_id == "search_1007"]
+        self.assertGreaterEqual(len(search_1007), 1)
+        self.assertEqual(search_1007[0].system_id, "search_service")
+
+    def test_deletion_worker_account_recovery(self):
+        """
+        Regression Test 4 (Issue 2): Recover account resource IDs from actual deletion-worker
+        activity chains instead of inferring account IDs from user IDs.
+        """
+        # User 541 (case_31): account_4857 (not account_541)
+        user_541 = self.graph.resolve_user("a.eze08@gmail.com")
+        self.assertIsNotNone(user_541)
+        req_31 = {
+            "reported_at": "2026-09-06T12:00:00Z",
+            "reported_status": "COMPLETE",
+            "requested_at": "2026-09-04T12:00:00Z",
+        }
+        acc_31 = self.store.get_or_recover_account_id(user_541, req_31)
+        self.assertEqual(acc_31, "account_4857", "Account ID must be recovered from deletion worker chain.")
+
+        # User 542 (case_32): account_8858 (not account_542)
+        user_542 = self.graph.resolve_user("addo.kofi@gmail.com")
+        self.assertIsNotNone(user_542)
+        req_32 = {
+            "reported_at": "2026-09-06T12:00:00Z",
+            "reported_status": "PARTIALLY_COMPLETE",
+            "requested_at": "2026-09-03T12:00:00Z",
+        }
+        acc_32 = self.store.get_or_recover_account_id(user_542, req_32)
+        self.assertEqual(acc_32, "account_8858", "Account ID must be recovered from deletion worker chain.")
+
+    def test_tightened_activity_correlation(self):
+        """
+        Regression Test 5 (Issue 3): Verify concurrent deletion jobs do not pull in decoy resources
+        belonging to other users without supporting identity or trace evidence.
+        """
+        # User 32 (case_11: novak.tomasz@icloud.com): shares 2026-09-12 timestamp with other batches.
+        # Must only contain user_32's own resources, not foreign search or support records.
+        user_32 = self.graph.resolve_user("novak.tomasz@icloud.com")
+        self.assertIsNotNone(user_32)
+        linked = self.store.get_user_linked_resources(user_32.user_id)
+        # Confirm decoys from other users running on 2026-09-12 are NOT linked
+        self.assertNotIn("search_8911", linked)
+        self.assertNotIn("support_4707", linked)
+        self.assertNotIn("backup_3870", linked)
 
 
 if __name__ == "__main__":

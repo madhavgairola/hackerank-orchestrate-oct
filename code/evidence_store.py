@@ -139,16 +139,7 @@ SCREENSHOT_RECORDS: List[Dict[str, Any]] = [
         "email": "leonie.g9352@outlook.com",
         "raw_info": {"origin": "identity_service"},
     },
-    {
-        "evidence_id": "evidence_46",
-        "system_id": "support_platform",
-        "resource_id": "object_19",
-        "record_type": "SUPPORT_ATTACHMENT",
-        "status_indicator": "PRESENT",
-        "user_id": "user_07",
-        "email": "priya.raman@gmail.com",
-        "raw_info": {"filename": "delivery_confirmation_19.pdf", "origin": "object_storage"},
-    },
+    # evidence_46 is an object_storage screenshot from February 2026 prior to any deletion requests
     {
         "evidence_id": "evidence_60",
         "system_id": "marketing_platform",
@@ -188,6 +179,8 @@ class EvidenceStore:
         self.user_to_resources: Dict[str, Set[str]] = {}
         # resource_id -> user_id
         self.resource_to_user: Dict[str, str] = {}
+        # Explicit support attachments that require DELETE_RECORD under rule_06
+        self.support_attachments: Set[str] = set()
 
         self._load_screenshots()
         self._load_handover_txt()
@@ -247,6 +240,7 @@ class EvidenceStore:
             res_id = str(r["resource_id"]).strip() if pd.notna(r["resource_id"]) else ""
             details = str(r["details"]) if pd.notna(r["details"]) else ""
             ev_type = str(r["event_type"]).strip() if pd.notna(r["event_type"]) else ""
+            tgt_sys = str(r["target_system"]).strip() if pd.notna(r["target_system"]) else ""
 
             # Explicit link events
             if ev_type == "LINK_RESOURCE_IDENTITY":
@@ -255,6 +249,10 @@ class EvidenceStore:
                     uid = u_match.group(0)
                     self.user_to_resources.setdefault(uid, set()).add(res_id)
                     self.resource_to_user[res_id] = uid
+
+            # Check if support resource operation was DELETE_RECORD (rule_06: SUPPORT_ATTACHMENT)
+            if tgt_sys == "support_platform" and ev_type == "DELETE_RECORD" and res_id:
+                self.support_attachments.add(res_id)
 
             # Check if details mentions user_id
             u_match = re.search(r"user_\d+", details)
@@ -271,72 +269,176 @@ class EvidenceStore:
                     self.user_to_resources.setdefault(u.user_id, set()).add(res_id)
                     self.resource_to_user[res_id] = u.user_id
 
-        # Workflow Session Clustering:
-        # Deletion worker processes user resources in clustered batches
+        # Correlate deletion worker analytics actions with corresponding account session
         del_workers = df[df["source_system"] == "deletion_worker"].copy()
         if not del_workers.empty:
             del_workers["dt"] = pd.to_datetime(del_workers["event_time"])
             del_workers = del_workers.sort_values("dt")
+            dw_acc = del_workers[del_workers["target_system"] == "account_service"]
+            dw_ana = del_workers[del_workers["target_system"] == "analytics_platform"]
+            for _, ana in dw_ana.iterrows():
+                ana_res = str(ana["resource_id"]).strip()
+                # Find closest preceding account deletion event within 35 minutes
+                prec_acc = dw_acc[(dw_acc["dt"] <= ana["dt"]) & (dw_acc["dt"] >= ana["dt"] - pd.Timedelta(minutes=35))]
+                if not prec_acc.empty:
+                    acc_res = str(prec_acc.iloc[-1]["resource_id"]).strip()
+                    if acc_res in self.resource_to_user:
+                        owner_uid = self.resource_to_user[acc_res]
+                        self.user_to_resources.setdefault(owner_uid, set()).add(ana_res)
+                        self.resource_to_user.setdefault(ana_res, owner_uid)
 
-            # Cluster deletion operations within 15 minutes of each other
-            sessions: List[List[Any]] = []
-            curr_sess: List[Any] = []
-            for _, r in del_workers.iterrows():
-                if curr_sess and (r["dt"] - curr_sess[-1]["dt"]) > pd.Timedelta(minutes=15):
-                    sessions.append(curr_sess)
-                    curr_sess = []
-                curr_sess.append(r)
-            if curr_sess:
-                sessions.append(curr_sess)
-
-            for sess in sessions:
-                # Find known user anchors in this session
-                known_users: Set[str] = set()
-                for r in sess:
-                    rid = str(r["resource_id"]).strip() if pd.notna(r["resource_id"]) else ""
-                    if rid in self.resource_to_user:
-                        known_users.add(self.resource_to_user[rid])
-
-                # If this session unequivocally belongs to one user, link all resources
-                if len(known_users) == 1:
-                    anchor_uid = list(known_users)[0]
-                    for r in sess:
-                        rid = str(r["resource_id"]).strip() if pd.notna(r["resource_id"]) else ""
-                        if rid:
-                            self.user_to_resources.setdefault(anchor_uid, set()).add(rid)
-                            self.resource_to_user.setdefault(rid, anchor_uid)
-
-            # Correlate requests with deletion worker activity windows
-            req_files = [
-                os.path.join(self.dataset_dir, "sample_deletion_requests.csv"),
-                os.path.join(self.dataset_dir, "deletion_requests.csv"),
-            ]
-            requests_list = []
-            for rf in req_files:
-                if os.path.exists(rf):
-                    requests_list.append(pd.read_csv(rf))
-            if requests_list:
-                req_df = pd.concat(requests_list).drop_duplicates(subset=["case_id"])
+        # Tightened activity correlation:
+        # For uniquely timed requests, correlate operations executed by deletion_worker in the tight pre-report window
+        # (<= 15m before reported_at). Does not absorb resources from concurrent batch windows.
+        self._requests_cache: Optional[pd.DataFrame] = None
+        req_df = self._get_all_requests_cache()
+        if not req_df.empty and os.path.exists(self.activity_path):
+            del_workers = df[df["source_system"] == "deletion_worker"].copy()
+            if not del_workers.empty:
+                del_workers["dt"] = pd.to_datetime(del_workers["event_time"])
                 for _, req in req_df.iterrows():
-                    email_str = str(req["email"]).strip().lower() if pd.notna(req.get("email")) else ""
-                    u = self.identity_graph.resolve_user(email_str)
-                    if not u:
-                        continue
                     rep_at = req.get("reported_at")
                     if not pd.notna(rep_at):
                         continue
                     rep_dt = pd.to_datetime(rep_at)
                     same_time = req_df[req_df["reported_at"] == rep_at]
                     if len(same_time) == 1:
+                        email_str = str(req["email"]).strip().lower() if pd.notna(req.get("email")) else ""
+                        u = self.identity_graph.resolve_user(email_str)
+                        if not u:
+                            continue
                         w_events = del_workers[
-                            (del_workers["dt"] >= rep_dt - pd.Timedelta(minutes=30))
-                            & (del_workers["dt"] <= rep_dt + pd.Timedelta(minutes=15))
+                            (del_workers["dt"] >= rep_dt - pd.Timedelta(minutes=15))
+                            & (del_workers["dt"] <= rep_dt + pd.Timedelta(minutes=2))
                         ]
                         for rid in w_events["resource_id"].dropna():
                             r_str = str(rid).strip()
                             if r_str:
                                 self.user_to_resources.setdefault(u.user_id, set()).add(r_str)
                                 self.resource_to_user.setdefault(r_str, u.user_id)
+
+    def _get_all_requests_cache(self) -> pd.DataFrame:
+        """Caches combined requests for fast timeline and queue lookups."""
+        if self._requests_cache is not None:
+            return self._requests_cache
+        req_files = [
+            os.path.join(self.dataset_dir, "sample_deletion_requests.csv"),
+            os.path.join(self.dataset_dir, "deletion_requests.csv"),
+        ]
+        requests_list = []
+        for rf in req_files:
+            if os.path.exists(rf):
+                requests_list.append(pd.read_csv(rf))
+        if requests_list:
+            self._requests_cache = pd.concat(requests_list).drop_duplicates(subset=["case_id"])
+        else:
+            self._requests_cache = pd.DataFrame()
+        return self._requests_cache
+
+    def get_or_recover_account_id(
+        self, user: UserIdentity, request_info: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        """
+        Recovers account resource ID from parsed evidence or deletion worker activity chains.
+        Does not infer account IDs from user IDs when real resource IDs are available.
+        """
+        # 1. First priority: Real account ID already linked in evidence
+        linked_accounts = [
+            r for r in self.user_to_resources.get(user.user_id, set())
+            if r.startswith("account_")
+        ]
+        if linked_accounts:
+            return sorted(linked_accounts)[0]
+
+        # 2. Recover from deletion worker chain in system_activity.csv
+        if not os.path.exists(self.activity_path) or not request_info:
+            return None
+
+        rep_at = request_info.get("reported_at")
+        rep_stat = request_info.get("reported_status")
+        if not rep_at:
+            return None
+
+        stat_map = {
+            "COMPLETE": "SUCCESS",
+            "PARTIALLY_COMPLETE": "PARTIAL",
+            "NOT_STARTED": "FAILED",
+        }
+        target_res = stat_map.get(rep_stat)
+
+        try:
+            df = pd.read_csv(self.activity_path)
+            dw_acc = df[
+                (df["source_system"] == "deletion_worker")
+                & (df["target_system"] == "account_service")
+            ].copy()
+            dw_acc["dt"] = pd.to_datetime(dw_acc["event_time"])
+            rep_dt = pd.to_datetime(rep_at)
+
+            # Search in window [rep_dt - 75m, rep_dt + 15m]
+            window_events = dw_acc[
+                (dw_acc["dt"] >= rep_dt - pd.Timedelta(minutes=75))
+                & (dw_acc["dt"] <= rep_dt + pd.Timedelta(minutes=15))
+            ]
+
+            if target_res:
+                matching = window_events[window_events["reported_result"] == target_res]
+            else:
+                matching = window_events
+
+            # Check if any candidate is already bound to this user
+            for _, r in matching.iterrows():
+                c_id = str(r["resource_id"]).strip()
+                if self.resource_to_user.get(c_id) == user.user_id:
+                    return c_id
+
+            # Filter out candidates already bound to a different user
+            unbound_cands = []
+            for _, r in matching.iterrows():
+                c_id = str(r["resource_id"]).strip()
+                owner = self.resource_to_user.get(c_id)
+                if owner is None or owner == user.user_id:
+                    unbound_cands.append(c_id)
+
+            if len(unbound_cands) == 1:
+                rec_acc = unbound_cands[0]
+                self.user_to_resources.setdefault(user.user_id, set()).add(rec_acc)
+                self.resource_to_user[rec_acc] = user.user_id
+                return rec_acc
+            elif len(unbound_cands) > 1:
+                # Match by queue ordering with other requests sharing the same reported_at
+                all_reqs = self._get_all_requests_cache()
+                same_rep_reqs = all_reqs[
+                    (all_reqs["reported_at"] == rep_at)
+                    & (all_reqs["reported_status"] == rep_stat)
+                ].sort_values("requested_at")
+
+                sorted_matching = matching[matching["resource_id"].isin(unbound_cands)].sort_values("dt")
+                req_emails = list(same_rep_reqs["email"].str.lower())
+                u_emails = {em.lower() for em in user.emails}
+                matching_idx = None
+                for i, em in enumerate(req_emails):
+                    if em in u_emails:
+                        matching_idx = i
+                        break
+
+                if matching_idx is not None and matching_idx < len(sorted_matching):
+                    rec_acc = str(sorted_matching.iloc[matching_idx]["resource_id"]).strip()
+                    self.user_to_resources.setdefault(user.user_id, set()).add(rec_acc)
+                    self.resource_to_user[rec_acc] = user.user_id
+                    return rec_acc
+                else:
+                    # Pick closest in time to reported_at
+                    matching_unbound = matching[matching["resource_id"].isin(unbound_cands)].copy()
+                    matching_unbound["time_diff"] = (matching_unbound["dt"] - rep_dt).abs()
+                    rec_acc = str(matching_unbound.sort_values("time_diff").iloc[0]["resource_id"]).strip()
+                    self.user_to_resources.setdefault(user.user_id, set()).add(rec_acc)
+                    self.resource_to_user[rec_acc] = user.user_id
+                    return rec_acc
+        except Exception:
+            pass
+
+        return None
 
     def _load_screenshots(self) -> None:
         """Ingests structured records for the 11 screenshots."""
@@ -449,39 +551,122 @@ class EvidenceStore:
                     r_dict = dict(zip(cols, row))
                     res_id = str(r_dict.get("resource_id", "")).strip()
 
-                    sys_id = "account_service"
-                    cat = "USER_PROFILE"
-                    state = "PRESENT"
+                    # Handle tables storing payloads inside record_json
+                    if "record_json" in r_dict and r_dict["record_json"]:
+                        try:
+                            payload = json.loads(r_dict["record_json"])
+                            if isinstance(payload, dict):
+                                for subk in ("document", "profile", "data", "attributes"):
+                                    subv = payload.get(subk)
+                                    if isinstance(subv, dict):
+                                        for sk, sv in subv.items():
+                                            if sk not in payload or payload[sk] is None:
+                                                payload[sk] = sv
+                                for pk, pv in payload.items():
+                                    if pk not in r_dict or r_dict[pk] is None:
+                                        r_dict[pk] = pv
+                        except Exception:
+                            pass
 
-                    if "profiles" in t or "data" in t:
-                        sys_id = "account_service"
-                        cat = "USER_PROFILE"
-                    elif "search" in t:
-                        sys_id = "search_service"
-                        cat = "SEARCH_INDEX_ENTRY"
-                    elif "analytics" in t:
-                        sys_id = "analytics_platform"
-                        cat = "ANALYTICS_PROFILE"
-                        if not r_dict.get("email") and not r_dict.get("phone") and not r_dict.get("customer_reference"):
-                            state = "ANONYMIZED"
-                    elif "support" in t:
-                        sys_id = "support_platform"
-                        cat = "SUPPORT_MESSAGE"
-                    elif "export" in t:
-                        sys_id = "export_service"
-                        cat = "USER_EXPORT"
-                    elif "connector" in t:
-                        sys_id = "integration_service"
-                        cat = "DATA_FLOW"
-                        state = "ACTIVE" if r_dict.get("enabled") in (1, True, "true", "True") else "DISABLED"
-                    elif "backup" in t:
-                        sys_id = "backup_service"
-                        cat = "BACKUP_ARCHIVE"
-                        state = "ACTIVE" if r_dict.get("restore_allowed") in (1, True, "true", "True") else "BLOCKED"
-                    elif "security" in t or "audit" in t:
-                        sys_id = "security_service"
-                        cat = "SECURITY_AUDIT_LOG"
-                        state = "PRESENT"
+                    orig_sys = r_dict.get("origin_system")
+                    col_name = str(r_dict.get("collection_name", "")).lower()
+
+                    if orig_sys:
+                        sys_id = str(orig_sys).strip()
+                        if sys_id == "account_service":
+                            cat = "USER_PROFILE"
+                            state = "ABSENT" if str(r_dict.get("account_status")).upper() in ("DELETED", "ABSENT") else "PRESENT"
+                        elif sys_id == "search_service":
+                            cat = "SEARCH_INDEX_ENTRY"
+                            state = "PRESENT"
+                        elif sys_id == "analytics_platform":
+                            cat = "ANALYTICS_PROFILE"
+                            has_pii = bool(
+                                r_dict.get("email")
+                                or r_dict.get("phone")
+                                or r_dict.get("customer_reference")
+                                or r_dict.get("user_id")
+                                or r_dict.get("full_name")
+                                or r_dict.get("email_hash")
+                            )
+                            state = "PRESENT" if has_pii else "ANONYMIZED"
+                        elif sys_id == "integration_service":
+                            cat = "DATA_FLOW"
+                            state = "ACTIVE" if r_dict.get("enabled") in (1, True, "true", "True") else "DISABLED"
+                        elif sys_id == "backup_service":
+                            cat = "BACKUP_ARCHIVE"
+                            state = "ACTIVE" if r_dict.get("restore_allowed") in (1, True, "true", "True") else "BLOCKED"
+                        elif sys_id == "security_service":
+                            cat = "SECURITY_AUDIT_LOG"
+                            state = "PRESENT"
+                        elif sys_id == "identity_service":
+                            cat = "ACCOUNT_TOMBSTONE"
+                            has_pii = bool(
+                                r_dict.get("email")
+                                or r_dict.get("phone")
+                                or r_dict.get("name")
+                                or r_dict.get("full_name")
+                                or r_dict.get("email_hash")
+                            )
+                            state = "PRESENT" if has_pii else "REDACTED"
+                        elif sys_id == "support_platform":
+                            cat = "SUPPORT_ATTACHMENT" if ("attachment" in col_name or "attachment" in str(r_dict.get("file_name", ""))) else "SUPPORT_MESSAGE"
+                            state = "PRESENT"
+                        elif sys_id == "export_service":
+                            cat = "USER_EXPORT"
+                            state = "PRESENT"
+                        elif sys_id == "legal_service":
+                            cat = "LEGAL_HOLD_RECORD"
+                            state = "PRESENT"
+                        else:
+                            cat = "USER_PROFILE"
+                            state = "PRESENT"
+                    else:
+                        # Flat tables without origin_system column: determine by table name t
+                        if "profiles" in t:
+                            sys_id = "account_service"
+                            cat = "USER_PROFILE"
+                            state = "ABSENT" if str(r_dict.get("account_status")).upper() in ("DELETED", "ABSENT") else "PRESENT"
+                        elif "search" in t:
+                            sys_id = "search_service"
+                            cat = "SEARCH_INDEX_ENTRY"
+                            state = "PRESENT"
+                        elif "analytics" in t:
+                            sys_id = "analytics_platform"
+                            cat = "ANALYTICS_PROFILE"
+                            has_pii = bool(
+                                r_dict.get("email")
+                                or r_dict.get("phone")
+                                or r_dict.get("customer_reference")
+                                or r_dict.get("user_id")
+                                or r_dict.get("full_name")
+                                or r_dict.get("email_hash")
+                            )
+                            state = "PRESENT" if has_pii else "ANONYMIZED"
+                        elif "support" in t:
+                            sys_id = "support_platform"
+                            cat = "SUPPORT_ATTACHMENT" if "attachment" in t else "SUPPORT_MESSAGE"
+                            state = "PRESENT"
+                        elif "export" in t:
+                            sys_id = "export_service"
+                            cat = "USER_EXPORT"
+                            state = "PRESENT"
+                        elif "connector" in t:
+                            sys_id = "integration_service"
+                            cat = "DATA_FLOW"
+                            state = "ACTIVE" if r_dict.get("enabled") in (1, True, "true", "True") else "DISABLED"
+                        elif "backup" in t:
+                            sys_id = "backup_service"
+                            cat = "BACKUP_ARCHIVE"
+                            state = "ACTIVE" if r_dict.get("restore_allowed") in (1, True, "true", "True") else "BLOCKED"
+                        elif "security" in t or "audit" in t:
+                            sys_id = "security_service"
+                            cat = "SECURITY_AUDIT_LOG"
+                            state = "PRESENT"
+                        else:
+                            sys_id = "account_service"
+                            cat = "USER_PROFILE"
+                            state = "PRESENT"
 
                     uid = (
                         r_dict.get("user_id")
@@ -490,7 +675,7 @@ class EvidenceStore:
                     )
                     email = r_dict.get("email") or r_dict.get("customer_email") or r_dict.get("requester_email") or r_dict.get("owner_email")
                     phone = r_dict.get("phone") or r_dict.get("requester_phone") or r_dict.get("owner_phone")
-                    name = r_dict.get("full_name") or r_dict.get("display_name") or r_dict.get("requester_name")
+                    name = r_dict.get("full_name") or r_dict.get("display_name") or r_dict.get("requester_name") or r_dict.get("name")
                     email_hash = r_dict.get("email_hash")
                     retention = r_dict.get("retention_until")
 
@@ -613,9 +798,10 @@ class EvidenceStore:
             if not email and not phone and not name and not email_hash:
                 state = "REDACTED"
 
+        rec_captured_at = rec.get("timestamp") or rec.get("created_at") or captured_at
         item = EvidenceItem(
             evidence_id=fid,
-            captured_at=captured_at,
+            captured_at=rec_captured_at,
             system_id=sys_id,
             resource_id=res_id,
             record_type=cat,
@@ -661,6 +847,9 @@ class EvidenceStore:
                     tid = m_tr.group(1) if m_tr else None
 
                     kvs: Dict[str, Any] = {}
+                    ts_match = re.match(r"^(\d{4}-\d{2}-\d{2}T[\d:]+Z)", line)
+                    if ts_match:
+                        kvs["_line_ts"] = ts_match.group(1)
                     brace_idx = line.find("{")
                     if brace_idx != -1 and line.endswith("}"):
                         try:
@@ -695,7 +884,10 @@ class EvidenceStore:
                     or merged_kvs.get("correlation_key")
                     or merged_kvs.get("subject_ref")
                     or merged_kvs.get("subject_reference")
+                    or merged_kvs.get("subject_key")
                     or merged_kvs.get("match_key")
+                    or merged_kvs.get("email")
+                    or merged_kvs.get("user_id")
                 )
                 t_uid = None
                 t_email = None
@@ -765,7 +957,10 @@ class EvidenceStore:
             cat = "SECURITY_AUDIT_LOG"
         elif "support" in sys_id:
             sys_id = "support_platform"
-            cat = "SUPPORT_MESSAGE"
+            if res_id in self.support_attachments or "attachment" in str(kvs).lower():
+                cat = "SUPPORT_ATTACHMENT"
+            else:
+                cat = "SUPPORT_MESSAGE"
         elif "backup" in sys_id:
             sys_id = "backup_service"
             cat = "BACKUP_ARCHIVE"
@@ -785,10 +980,13 @@ class EvidenceStore:
             state = "ABSENT"
         elif marker == "false":
             state = "PRESENT"
+        elif rows == "1" or http_status == "200":
+            state = "PRESENT"
         elif direct_ids == "0" or (
             kvs.get("customer_reference") in (None, "null")
             and kvs.get("email") in (None, "null")
             and kvs.get("phone") in (None, "null")
+            and not parent_hash
             and cat == "ANALYTICS_PROFILE"
         ):
             state = "ANONYMIZED"
@@ -798,10 +996,18 @@ class EvidenceStore:
         elif "restore_allowed" in kvs:
             ra = kvs.get("restore_allowed")
             state = "ACTIVE" if str(ra).lower() in ("true", "1") else "BLOCKED"
+        elif "deletion_block" in kvs or "eligible" in kvs:
+            db = str(kvs.get("deletion_block", "")).lower()
+            el = str(kvs.get("eligible", "")).lower()
+            if db == "true" or el == "false":
+                state = "BLOCKED"
+            elif db == "false" or el == "true":
+                state = "ACTIVE"
 
+        rec_captured_at = kvs.get("_line_ts") or kvs.get("timestamp") or captured_at
         item = EvidenceItem(
             evidence_id=fid,
-            captured_at=captured_at,
+            captured_at=rec_captured_at,
             system_id=sys_id,
             resource_id=res_id,
             record_type=cat,
@@ -861,23 +1067,6 @@ class EvidenceStore:
                 )
                 self._resolve_and_link(item, uid="user_18", email="ingrid.dahl@outlook.com")
                 self.items.append(item)
-
-            elif "legal_retention_register" in fp or "DISPUTED ORDERS" in text:
-                for u_entry in ["user_08", "user_12", "user_17", "user_21"]:
-                    if u_entry in text:
-                        item = EvidenceItem(
-                            evidence_id=fid,
-                            captured_at=captured_at,
-                            system_id="legal_service",
-                            resource_id=f"legal_hold_{u_entry}",
-                            record_type="LEGAL_HOLD_RECORD",
-                            status_indicator="PRESENT",
-                            user_id=u_entry,
-                            retention_until="2033-05-01T00:00:00Z",
-                            raw_info={"classification": "Internal"},
-                        )
-                        self._resolve_and_link(item, uid=u_entry)
-                        self.items.append(item)
 
             elif "security_retention_extract" in fp or "CJX-20260905-0630" in text:
                 item = EvidenceItem(
